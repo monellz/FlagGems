@@ -54,6 +54,7 @@ class BenchConfig:
         self.user_desired_metrics = None
         self.shape_file = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
         self.query = False
+        self.use_cudagraph = False
 
 
 Config = BenchConfig()
@@ -143,6 +144,14 @@ def pytest_addoption(parser):
         help="Benchmark info recorded in log files or not",
     )
 
+    parser.addoption(
+        "--use_cudagraph",
+        action="store_true",
+        default=False,
+        required=False,
+        help="use cuda graph to benchmark if possisble",
+    )
+
 
 def pytest_configure(config):
     global Config  # noqa: F824
@@ -196,6 +205,8 @@ def pytest_configure(config):
         recordLogger.addHandler(handler)
         recordLogger.setLevel(logging.INFO)
         emit_record_logger("Benchmark record logger enabled")
+    
+    Config.use_cudagraph = config.getoption("--use_cudagraph")
 
 
 BUILTIN_MARKS = {

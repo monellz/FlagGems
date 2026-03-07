@@ -281,18 +281,28 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / Config.repetition * 1000
         elif Config.mode == BenchMode.KERNEL:
-            do_bench = (
-                triton.musa_testing.do_bench
-                if device == "musa"
-                else triton.testing.do_bench
-            )
-            latency = do_bench(
-                fn,
-                warmup=Config.warm_up,
-                rep=Config.repetition,
-                return_mode="median",
-                grad_to_none=xs if self.is_backward else None,
-            )
+            bench_kwargs = {}
+            bench_kwargs["warmup"] = Config.warm_up
+            bench_kwargs["rep"] = Config.repetition
+            bench_kwargs["return_mode"] = "median"
+            bench_kwargs["grad_to_none"] = xs if self.is_backward else None
+            if device == "musa":
+                do_bench = triton.musa_testing.do_bench
+            else:
+                if Config.use_cudagraph:
+                    do_bench = triton.testing.do_bench_cudagraph
+                    # no rep argument
+                    bench_kwargs.pop("warmup")
+
+                    # warmup to trigger triton jit
+                    for i in range(5):
+                        fn()
+                    torch_device_fn.synchronize()
+                else:
+                    print("[zrx] not use cuda graph")
+                    do_bench = triton.testing.do_bench
+            
+            latency = do_bench(fn=fn, **bench_kwargs)
         elif Config.mode == BenchMode.WRAPPER:
             for i in range(Config.warm_up):
                 fn()
