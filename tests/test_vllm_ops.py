@@ -324,6 +324,8 @@ def test_accuracy_fused_moe(config, dtype):
         w2,
         topk_weights,
         topk_ids,
+        inplace=False,
+        activation="silu",
     )
 
     torch.cuda.synchronize()
