@@ -323,7 +323,8 @@ class FusedMoEBenchmark(Benchmark):
 def _vllm_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
     """Wrapper to call vllm fused_experts_impl."""
     return vllm_fused_experts_impl(
-        hidden_states.clone(),
+        # hidden_states.clone(),
+        hidden_states,
         w1,
         w2,
         topk_weights,
@@ -356,4 +357,137 @@ def test_perf_fused_moe_gems_vs_vllm():
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fused_moe_wrapper)
+    bench.run()
+
+
+
+
+# =====================================================================
+# Fused MoE (fused_experts) benchmark: FlagGems vs sonicmoe
+# =====================================================================
+try:
+    from sonicmoe.functional import moe_general_routing_inputs
+    from sonicmoe.enums import ActivationType
+    HAS_SONICMOE_FUSED_MOE = True
+except ImportError:
+    HAS_SONICMOE_FUSED_MOE = False
+
+class FusedMoEBenchmarkVsSonicmoe(Benchmark):
+    """
+    Benchmark for fused_experts_impl comparing FlagGems Triton kernel vs sonicmoe.
+
+    Measures latency of the full fused MoE pipeline:
+      moe_align_block_size → GEMM1(up+gate) → SiLU+Mul → GEMM2(down) → moe_sum
+    """
+
+    def __init__(self, op_name, torch_op, dtypes):
+        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+
+    def set_shapes(self, shape_file_path=None):
+        # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
+        self.shapes = [
+            # Mixtral-like shapes
+            (1, 8, 4096, 14336, 2),
+            (4, 8, 4096, 14336, 2),
+            (16, 8, 4096, 14336, 2),
+            (64, 8, 4096, 14336, 2),
+            (128, 8, 4096, 14336, 2),
+            (256, 8, 4096, 14336, 2),
+            (512, 8, 4096, 14336, 2),
+            # DeepSeek-V3-like shapes (TP=8 shard)
+            (1, 256, 7168, 2048, 8),
+            (4, 256, 7168, 2048, 8),
+            (16, 256, 7168, 2048, 8),
+            (64, 256, 7168, 2048, 8),
+            # FIXME: oom
+            # (128, 256, 7168, 2048, 8),
+            # (256, 256, 7168, 2048, 8),
+        ]
+
+    def get_input_iter(self, cur_dtype):
+        for config in self.shapes:
+            yield from self._fused_moe_input_fn(config, cur_dtype)
+
+    def _fused_moe_input_fn(self, config, dtype):
+        num_tokens, num_experts, hidden_size, intermediate_size, topk = config
+        device = flag_gems.device
+
+        hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+        w1 = torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        w2 = torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        gating = torch.randn(
+            num_tokens, num_experts, device=device, dtype=torch.float32
+        )
+        topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(dtype)
+
+
+        # sonic moe
+        token_indices  = torch.arange(num_tokens, dtype=torch.int32, device=device).unsqueeze(1).expand(-1, topk).reshape(-1)
+        expert_indices = topk_ids.reshape(-1)
+        router_scores  = topk_weights.reshape(-1)
+        w1_sonic = torch.empty_like(w1)
+        w1_sonic[:, 0::2, :] = w1[:, :intermediate_size, :]
+        w1_sonic[:, 1::2, :] = w1[:, intermediate_size:, :]
+
+        yield (hidden_states, w1, w2, topk_weights, topk_ids, token_indices, expert_indices, router_scores, w1_sonic)
+
+
+def _sonicmoe_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids, token_indices, expert_indices, router_scores, w1_sonic):
+    """Wrapper to call sonicmoe fused_experts_impl."""
+    num_experts = w1_sonic.shape[0]
+    ref, _ = moe_general_routing_inputs(
+        hidden_states,
+        router_scores,
+        token_indices,
+        expert_indices,
+        w1_sonic.permute(1, 2, 0),
+        None,
+        w2.permute(1, 2, 0),
+        None,
+        num_experts,
+        torch.cuda.current_stream().cuda_stream,
+        ActivationType.SWIGLU,
+        is_inference_mode_enabled=True,
+    )
+    return ref
+
+
+def _gems_fused_moe_wrapper_in_sonic_bench(hidden_states, w1, w2, topk_weights, topk_ids, token_indices, expert_indices, router_scores, w1_sonic):
+    """Wrapper to call FlagGems fused_experts_impl."""
+    return flag_gems.fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+    )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not HAS_SONICMOE_FUSED_MOE, reason="sonicmoe not installed")
+def test_perf_fused_moe_gems_vs_sonicmoe():
+    """
+    Benchmark FlagGems fused_experts_impl vs sonicmoe fused_experts_impl (bf16).
+    """
+    bench = FusedMoEBenchmarkVsSonicmoe(
+        op_name="fused_moe_gems_vs_sonicmoe",
+        torch_op=_sonicmoe_fused_moe_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fused_moe_wrapper_in_sonic_bench)
     bench.run()

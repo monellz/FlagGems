@@ -299,7 +299,6 @@ class Benchmark:
                         fn()
                     torch_device_fn.synchronize()
                 else:
-                    print("[zrx] not use cuda graph")
                     do_bench = triton.testing.do_bench
             
             latency = do_bench(fn=fn, **bench_kwargs)
