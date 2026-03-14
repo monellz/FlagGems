@@ -450,6 +450,8 @@ def fused_experts_impl(
     w1_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    a1_scale: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Complete fused MoE forward pass (bf16/fp16/fp8_w8a8).
@@ -486,12 +488,14 @@ def fused_experts_impl(
     if num_experts <= 0:
         num_experts = E
 
+    if out_dtype is None:
+        out_dtype = hidden_states.dtype
     # Determine compute type
-    if hidden_states.dtype == torch.bfloat16:
+    if out_dtype == torch.bfloat16:
         compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
+    elif out_dtype == torch.float16:
         compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
+    elif out_dtype == torch.float32:
         compute_type = tl.float32
     else:
         raise ValueError(f"Unsupported dtype: {hidden_states.dtype}")
@@ -504,34 +508,38 @@ def fused_experts_impl(
     )
 
     intermediate_cache1 = torch.empty(
-        (M, top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
+        (M, top_k, N), dtype=out_dtype, device=hidden_states.device
     )
     intermediate_cache2 = torch.empty(
-        (M * top_k, N // 2), dtype=hidden_states.dtype, device=hidden_states.device
+        (M * top_k, N // 2), dtype=out_dtype, device=hidden_states.device
     )
     intermediate_cache3 = torch.empty(
-        (M, top_k, K), dtype=hidden_states.dtype, device=hidden_states.device
+        (M, top_k, K), dtype=out_dtype, device=hidden_states.device
     )
-    output = torch.zeros((M, K), dtype=hidden_states.dtype, device=hidden_states.device)
+    output = torch.zeros((M, K), dtype=out_dtype, device=hidden_states.device)
 
     # Quantize input for GEMM1
-    if use_fp8_w8a8:
-        hidden_states, a1q_scale = per_token_group_quant_fp8(
+    if use_fp8_w8a8 and a1_scale is None:
+        # need to quantize hidden_states
+        assert hidden_states.dtype != torch.float8_e4m3fn, f"hidden_states must be fp8_e4m3fn if a1_scale is not provided when use_fp8_w8a8 is True"
+        hidden_states, a1_scale = per_token_group_quant_fp8(
             hidden_states,
             group_size=block_shape[1],
             dtype=torch.float8_e4m3fn,
             column_major_scales=True,
             scale_ue8m0=False,
         )
-    else:
-        a1q_scale = None
+    if use_fp8_w8a8 and a1_scale is not None:
+        # already quantized
+        assert a1_scale.dtype == torch.float32, f"a1_scale must be float32 if hidden_states is fp8_e4m3fn"
+        assert hidden_states.dtype == torch.float8_e4m3fn, f"hidden_states must be fp8_e4m3fn if a1_scale is provided when use_fp8_w8a8 is True"
 
     # GEMM1: hidden_states @ W1 → intermediate_cache1
     invoke_fused_moe_triton_kernel(
         A=hidden_states,
         B=w1,
         C=intermediate_cache1,
-        A_scale=a1q_scale,
+        A_scale=a1_scale,
         B_scale=w1_scale,
         topk_weights=None,
         sorted_token_ids=sorted_token_ids,

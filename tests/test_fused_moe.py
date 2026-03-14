@@ -6,6 +6,7 @@ Tests FlagGems fused_experts_impl against:
   - SonicMoE's moe_general_routing_inputs (bf16)
 """
 
+from math import ceil
 import pytest
 import torch
 
@@ -182,13 +183,22 @@ def _generate_moe_weights(
     dtype: torch.dtype,
     device: torch.device,
     block_shape: tuple[int, int] | None = None,
+    sort_topk_ids: bool = False,
 ):
-    gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(
-        torch.softmax(gating, dim=-1), topk, dim=-1,
-    )
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(torch.float32)
+    if sort_topk_ids:
+        topk_ids = torch.randint(
+            0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device
+        )
+        topk_ids, _ = torch.sort(topk_ids, dim=1)
+        topk_weights = torch.randn((num_tokens, topk), dtype=torch.float32, device=device) / topk
+    else:
+        gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(gating, dim=-1), topk, dim=-1,
+        )
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(torch.float32)
+
 
     w1 = (torch.randn(num_experts, intermediate_size * 2, hidden_size, device=device, dtype=torch.float32)
           * (1.0 / hidden_size ** 0.5))
@@ -200,8 +210,8 @@ def _generate_moe_weights(
         assert hidden_size % block_shape[1] == 0, f"{hidden_size} % {block_shape[1]} != 0"
         w1_scale = torch.randn(
             num_experts,
-            intermediate_size * 2 // block_shape[0],
-            hidden_size // block_shape[1],
+            ceil(intermediate_size * 2 / block_shape[0]),
+            ceil(hidden_size / block_shape[1]),
             device=device,
             dtype=torch.float32,
         )
@@ -217,14 +227,13 @@ def _generate_moe_weights(
         assert hidden_size % block_shape[1] == 0, f"{hidden_size} % {block_shape[1]} != 0"
         w2_scale = torch.randn(
             num_experts,
-            hidden_size // block_shape[0],
-            intermediate_size // block_shape[1],
+            ceil(hidden_size / block_shape[0]),
+            ceil(intermediate_size / block_shape[1]),
             device=device,
             dtype=torch.float32,
         )
     else:
         w2_scale = None
-
     return w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
 
 # =====================================================================
@@ -246,6 +255,12 @@ try:
 except ImportError:
     HAS_SONICMOE_FUSED_MOE = False
 
+try:
+    import hpc
+    HAS_HPC_FUSED_MOE = True
+except ImportError:
+    HAS_HPC_FUSED_MOE = False
+
 
 # =====================================================================
 # Tests: FlagGems vs vLLM (bf16 / fp16)
@@ -261,9 +276,6 @@ def test_fused_moe_bf16_vs_vllm(config, dtype):
     device = flag_gems.device
     torch.manual_seed(0)
 
-    # hidden_states, w1, w2, topk_weights, topk_ids = _generate_moe_inputs(
-    #     num_tokens, num_experts, hidden_size, intermediate_size, topk, dtype, device,
-    # )
     hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
     w1, w2, _, _, topk_weights, topk_ids = _generate_moe_weights(
         num_tokens, num_experts, hidden_size, intermediate_size, topk, dtype, device, block_shape=None,
@@ -368,6 +380,72 @@ def test_fused_moe_fp8_w8a8_blockwise_vs_vllm(config, block_shape):
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
+    )
+    torch.cuda.synchronize()
+
+    rtol = 2e-1
+    atol = max(5e-2, ref.abs().max().item() * 5e-2)
+    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+
+
+# =====================================================================
+# Tests: FlagGems vs hpc-ops (fp8 w8a8)
+# =====================================================================
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("config", FUSED_MOE_CONFIGS)
+# @pytest.mark.parametrize("config",[
+#     # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
+#     (128, 128, 512, 512, 8),
+# ])
+@pytest.mark.parametrize("block_shape", [[128, 128]])
+@pytest.mark.skipif(not HAS_HPC_FUSED_MOE, reason="hpc-ops not installed")
+def test_fused_moe_fp8_w8a8_blockwise_vs_hpc(config, block_shape):
+    """FlagGems fused_moe (fp8 w8a8, block-wise) vs hpc-ops."""
+    num_tokens, num_experts, hidden_size, intermediate_size, topk = config
+    assert block_shape[0] == block_shape[1]
+    if block_shape[0] != 128 or block_shape[1] != 128:
+        pytest.skip("Invalid block shape for hpc-ops")
+    if hidden_size % block_shape[1] != 0:
+        pytest.skip("Invalid shape for block-wise quantization")
+    if intermediate_size % block_shape[0] != 0:
+        pytest.skip("Invalid shape for block-wise quantization")
+    if ceil(intermediate_size * 2 / 128) % 4 != 0:
+        pytest.skip("Invalid shape for hpc-ops")
+    if ceil(hidden_size / 128) % 4 != 0:
+        pytest.skip("Invalid shape for hpc-ops")
+    device = flag_gems.device
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+
+    hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    w1, w2, w1_scale, w2_scale, topk_weights, topk_ids = _generate_moe_weights(
+        num_tokens, num_experts, hidden_size, intermediate_size, topk, torch.float8_e4m3fn, device, block_shape=block_shape,
+        sort_topk_ids=True,
+    )
+    hidden_states, a1_scale = native_per_token_group_quant_fp8(hidden_states, block_shape[1])
+
+    result = flag_gems.fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids,
+        num_experts=num_experts,
+        use_fp8_w8a8=True,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        a1_scale=a1_scale,
+        out_dtype=dtype,
+    )
+    ref = hpc.fuse_moe_blockwise_fp8(
+        hidden_states, 
+        a1_scale,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        0,
+        num_experts,
     )
     torch.cuda.synchronize()
 

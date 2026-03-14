@@ -70,6 +70,12 @@ try:
 except ImportError:
     HAS_SONICMOE = False
 
+try:
+    import hpc
+    HAS_HPC = True
+except ImportError:
+    HAS_HPC = False
+
 
 # =====================================================================
 # Input generators
@@ -99,7 +105,7 @@ def _generate_bf16_inputs(config, dtype, device):
     return hidden_states, w1, w2, topk_weights, topk_ids
 
 
-def _generate_fp8_blockwise_inputs(config, block_shape, device):
+def _generate_fp8_blockwise_inputs(config, block_shape, device, sort_topk_ids=False):
     """Generate fp8 w8a8 block-wise quantized MoE inputs for benchmarking."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     block_n, block_k = block_shape
@@ -130,12 +136,19 @@ def _generate_fp8_blockwise_inputs(config, block_shape, device):
         device=device, dtype=torch.float32,
     ) + 0.01
 
-    gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(
-        torch.softmax(gating, dim=-1), topk, dim=-1,
-    )
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(torch.float32)
+    if sort_topk_ids:
+        topk_ids = torch.randint(
+            0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device
+        )
+        topk_ids, _ = torch.sort(topk_ids, dim=1)
+        topk_weights = torch.randn((num_tokens, topk), dtype=torch.float32, device=device) / topk
+    else:
+        gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(gating, dim=-1), topk, dim=-1,
+        )
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(torch.float32)
 
     return hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
 
@@ -195,7 +208,7 @@ def test_perf_fused_moe_bf16_gems_vs_vllm():
 DEFAULT_BLOCK_SHAPE = [128, 128]
 
 
-class FusedMoEFp8BlockwiseBenchmark(Benchmark):
+class FusedMoEFp8BlockwiseVLLMBenchmark(Benchmark):
     """fused_moe fp8 w8a8 block-wise: FlagGems vs vLLM."""
 
     def __init__(self, op_name, torch_op, dtypes, block_shape=None):
@@ -216,41 +229,103 @@ class FusedMoEFp8BlockwiseBenchmark(Benchmark):
         )
         yield inputs
 
-
-def _vllm_fp8_blockwise_wrapper(
-    hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
-):
-    return vllm_fused_experts_impl(
-        hidden_states, w1, w2, topk_weights, topk_ids,
-        inplace=False, activation="silu",
-        use_fp8_w8a8=True,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-        block_shape=DEFAULT_BLOCK_SHAPE,
-    )
-
-
-def _gems_fp8_blockwise_wrapper(
-    hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
-):
-    return flag_gems.fused_experts_impl(
-        hidden_states, w1, w2, topk_weights, topk_ids,
-        use_fp8_w8a8=True,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-        block_shape=DEFAULT_BLOCK_SHAPE,
-    )
-
-
 @pytest.mark.fused_moe
 @pytest.mark.skipif(not HAS_VLLM, reason="vllm not installed")
 def test_perf_fused_moe_fp8_blockwise_gems_vs_vllm():
     """Benchmark FlagGems vs vLLM fused_moe (fp8 w8a8 block-wise 128x128)."""
-    bench = FusedMoEFp8BlockwiseBenchmark(
+    def _vllm_fp8_blockwise_wrapper(
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
+    ):
+        return vllm_fused_experts_impl(
+            hidden_states, w1, w2, topk_weights, topk_ids,
+            inplace=False, activation="silu",
+            use_fp8_w8a8=True,
+            w1_scale=w1_scale, w2_scale=w2_scale,
+            block_shape=DEFAULT_BLOCK_SHAPE,
+        )
+    def _gems_fp8_blockwise_wrapper(
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
+    ):
+        return flag_gems.fused_experts_impl(
+            hidden_states, w1, w2, topk_weights, topk_ids,
+            use_fp8_w8a8=True,
+            w1_scale=w1_scale, w2_scale=w2_scale,
+            block_shape=DEFAULT_BLOCK_SHAPE,
+        )
+    bench = FusedMoEFp8BlockwiseVLLMBenchmark(
         op_name="fused_moe_fp8_blockwise_gems_vs_vllm",
         torch_op=_vllm_fp8_blockwise_wrapper,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fp8_blockwise_wrapper)
     bench.run()
+
+
+class FusedMoEFp8BlockwiseHPCBenchmark(Benchmark):
+    """fused_moe fp8 w8a8 block-wise: FlagGems vs hpc-ops."""
+
+    def __init__(self, op_name, torch_op, dtypes, block_shape=None):
+        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        self.block_shape = block_shape or DEFAULT_BLOCK_SHAPE
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = MOE_SHAPES
+
+    def get_input_iter(self, cur_dtype):
+        for config in self.shapes:
+            torch.cuda.empty_cache()
+            yield from self._input_fn(config)
+
+    def _input_fn(self, config):
+        num_experts = config[1]
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids = _generate_fp8_blockwise_inputs(
+            config, self.block_shape, flag_gems.device,
+            sort_topk_ids=True,
+        )
+        from flag_gems.ops.per_token_group_quant_fp8 import per_token_group_quant_fp8
+        hidden_states, a1_scale = per_token_group_quant_fp8(
+            hidden_states,
+            group_size=self.block_shape[1],
+            dtype=torch.float8_e4m3fn,
+            column_major_scales=True,
+            scale_ue8m0=False,
+        )
+        hidden_states = hidden_states.contiguous()
+        a1_scale = a1_scale.contiguous()
+
+        yield hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts
+
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not HAS_HPC, reason="hpc-ops not installed")
+def test_perf_fused_moe_fp8_blockwise_gems_vs_hpc():
+    """Benchmark FlagGems vs hpc-ops fused_moe (fp8 w8a8 block-wise 128x128)."""
+    def _hpc_fp8_blockwise_wrapper(
+        hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
+    ):
+        return hpc.fuse_moe_blockwise_fp8(
+            hidden_states, a1_scale, w1, w1_scale, w2, w2_scale, topk_ids, topk_weights, 0, num_experts,
+        )
+    def _gems_fp8_blockwise_wrapper(
+        hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
+    ):
+        return flag_gems.fused_experts_impl(
+            hidden_states, w1, w2, topk_weights, topk_ids,
+            num_experts=num_experts,
+            use_fp8_w8a8=True,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=DEFAULT_BLOCK_SHAPE,
+            a1_scale=a1_scale,
+            out_dtype=torch.bfloat16, # must be bf16
+        )
+    bench = FusedMoEFp8BlockwiseHPCBenchmark(
+        op_name="fused_moe_fp8_blockwise_gems_vs_hpc",
+        torch_op=_hpc_fp8_blockwise_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fp8_blockwise_wrapper) 
+    bench.run()
+
 
 
 # =====================================================================
