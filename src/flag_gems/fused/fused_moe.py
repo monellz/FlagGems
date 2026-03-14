@@ -31,6 +31,7 @@ import triton.language as tl
 from flag_gems.fused.moe_align_block_size import moe_align_block_size
 from flag_gems.fused.moe_sum import moe_sum
 from flag_gems.fused.silu_and_mul import silu_and_mul_kernel
+from flag_gems.ops.per_token_group_quant_fp8 import per_token_group_quant_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -445,21 +446,29 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     num_experts: int = -1,
     activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    block_shape: list[int] | None = None,
 ) -> torch.Tensor:
     """
-    Complete fused MoE forward pass (bf16/fp16, no quantization).
+    Complete fused MoE forward pass (bf16/fp16/fp8_w8a8).
 
     Pipeline:
-        moe_align_block_size → GEMM1(up+gate) → SiLU+Mul → GEMM2(down) → moe_sum
+        [quant input] → moe_align → GEMM1 → SiLU+Mul → [quant intermediate] → GEMM2 → moe_sum
 
     Args:
         hidden_states: [num_tokens, hidden_size]
-        w1: [E, intermediate_size * 2, hidden_size]  (gate + up projection)
-        w2: [E, hidden_size, intermediate_size]       (down projection)
+        w1: [E, intermediate_size * 2, hidden_size]
+        w2: [E, hidden_size, intermediate_size]
         topk_weights: [num_tokens, topk]
         topk_ids: [num_tokens, topk]
         num_experts: Total number of experts (default: inferred from w1)
         activation: Activation function name ("silu")
+        use_fp8_w8a8: Enable FP8 W8A8 quantization
+        w1_scale: Weight scale for w1 (required if use_fp8_w8a8)
+        w2_scale: Weight scale for w2 (required if use_fp8_w8a8)
+        block_shape: [block_n, block_k] for block-wise quantization
 
     Returns:
         output: [num_tokens, hidden_size]
@@ -487,37 +496,43 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported dtype: {hidden_states.dtype}")
 
-    # Get kernel config
-    config = get_default_config(M, E, w2.shape[1], K, top_k, None)
+    config_dtype = "fp8_w8a8" if use_fp8_w8a8 else None
+    config = get_default_config(M, E, w2.shape[1], K, top_k, config_dtype, block_shape)
 
-    # Step 1: Align tokens to experts
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], num_experts
     )
 
-    # Allocate intermediate buffers
-    # GEMM1 output: [M, topk, N]
     intermediate_cache1 = torch.empty(
         (M, top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
     )
-    # After activation (SiLU+Mul): [M * topk, N // 2]
     intermediate_cache2 = torch.empty(
         (M * top_k, N // 2), dtype=hidden_states.dtype, device=hidden_states.device
     )
-    # GEMM2 output: [M, topk, K]
     intermediate_cache3 = torch.empty(
         (M, top_k, K), dtype=hidden_states.dtype, device=hidden_states.device
     )
-    # Final output: [M, K]
     output = torch.zeros((M, K), dtype=hidden_states.dtype, device=hidden_states.device)
 
-    # Step 2: GEMM1 — hidden_states @ W1 → intermediate_cache1
+    # Quantize input for GEMM1
+    if use_fp8_w8a8:
+        hidden_states, a1q_scale = per_token_group_quant_fp8(
+            hidden_states,
+            group_size=block_shape[1],
+            dtype=torch.float8_e4m3fn,
+            column_major_scales=True,
+            scale_ue8m0=False,
+        )
+    else:
+        a1q_scale = None
+
+    # GEMM1: hidden_states @ W1 → intermediate_cache1
     invoke_fused_moe_triton_kernel(
         A=hidden_states,
         B=w1,
         C=intermediate_cache1,
-        A_scale=None,
-        B_scale=None,
+        A_scale=a1q_scale,
+        B_scale=w1_scale,
         topk_weights=None,
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
@@ -526,30 +541,44 @@ def fused_experts_impl(
         top_k=top_k,
         config=config,
         compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        block_shape=block_shape,
     )
 
-    # Step 3: Activation — SiLU(gate) * up
+    # Activation: SiLU(gate) * up
     _apply_silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
-    # Step 4: GEMM2 — intermediate @ W2 → intermediate_cache3
-    #         Multiply router weights here
+    # Quantize intermediate for GEMM2
+    if use_fp8_w8a8:
+        intermediate_cache2, a2q_scale = per_token_group_quant_fp8(
+            intermediate_cache2,
+            group_size=block_shape[1],
+            dtype=torch.float8_e4m3fn,
+            column_major_scales=True,
+            scale_ue8m0=False,
+        )
+    else:
+        a2q_scale = None
+
+    # GEMM2: intermediate @ W2 → intermediate_cache3
     invoke_fused_moe_triton_kernel(
         A=intermediate_cache2,
         B=w2,
         C=intermediate_cache3,
-        A_scale=None,
-        B_scale=None,
+        A_scale=a2q_scale,
+        B_scale=w2_scale,
         topk_weights=topk_weights,
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=True,
-        top_k=1,  # After activation, each token-expert pair is independent
+        top_k=1,
         config=config,
         compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        block_shape=block_shape,
     )
 
-    # Step 5: Reduce — sum over topK experts
     moe_sum(intermediate_cache3, output)
 
     return output
