@@ -47,6 +47,13 @@ if not QUICK_MODE:
         (64, 256, 7168, 2048, 8),
         (128, 256, 7168, 2048, 8),
         (256, 256, 7168, 2048, 8),
+        # Qwen3.5-397B-A17B
+        (1, 512, 4096, 1024, 10),
+        (4, 512, 4096, 1024, 10),
+        (16, 512, 4096, 1024, 10),
+        (64, 512, 4096, 1024, 10),
+        (128, 512, 4096, 1024, 10),
+        (256, 512, 4096, 1024, 10),
     ]
 
 # =====================================================================
@@ -283,7 +290,7 @@ def test_fused_moe_bf16_vs_vllm(config, dtype):
 
     result = flag_gems.fused_experts_impl(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        num_experts=num_experts,
+        global_num_experts=num_experts,
     )
 
     ref = vllm_fused_experts_impl(
@@ -324,7 +331,7 @@ def test_fused_moe_fp8_w8a8_blockwise_vs_torchref(config, block_shape):
 
     result = flag_gems.fused_experts_impl(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        num_experts=num_experts,
+        global_num_experts=num_experts,
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -366,7 +373,7 @@ def test_fused_moe_fp8_w8a8_blockwise_vs_vllm(config, block_shape):
 
     result = flag_gems.fused_experts_impl(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        num_experts=num_experts,
+        global_num_experts=num_experts,
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -423,20 +430,24 @@ def test_fused_moe_fp8_w8a8_blockwise_vs_hpc(config, block_shape):
         num_tokens, num_experts, hidden_size, intermediate_size, topk, torch.float8_e4m3fn, device, block_shape=block_shape,
         sort_topk_ids=True,
     )
-    hidden_states, a1_scale = native_per_token_group_quant_fp8(hidden_states, block_shape[1])
-
+    from flag_gems.ops.per_token_group_quant_fp8 import per_token_group_quant_fp8
+    hidden_states_q, a1_scale = per_token_group_quant_fp8(
+        hidden_states,
+        group_size=block_shape[1],
+        dtype=torch.float8_e4m3fn,
+        column_major_scales=False,
+        scale_ue8m0=False,
+    )
     result = flag_gems.fused_experts_impl(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        num_experts=num_experts,
+        global_num_experts=num_experts,
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
-        a1_scale=a1_scale,
-        out_dtype=dtype,
     )
     ref = hpc.fuse_moe_blockwise_fp8(
-        hidden_states, 
+        hidden_states_q, 
         a1_scale,
         w1,
         w1_scale,
@@ -479,7 +490,7 @@ def test_fused_moe_vs_sonicmoe(config, dtype):
 
     result = flag_gems.fused_experts_impl(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        num_experts=num_experts,
+        global_num_experts=num_experts,
     )
 
     # SonicMoE expects interleaved gate/up layout and [N, K, E] weight order

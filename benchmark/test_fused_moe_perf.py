@@ -35,6 +35,13 @@ MOE_SHAPES = [
     (64, 256, 7168, 2048, 8),
     (128, 256, 7168, 2048, 8),
     (256, 256, 7168, 2048, 8),
+    # Qwen3.5-397B-A17B
+    (1, 512, 4096, 1024, 10),
+    (4, 512, 4096, 1024, 10),
+    (16, 512, 4096, 1024, 10),
+    (64, 512, 4096, 1024, 10),
+    (128, 512, 4096, 1024, 10),
+    (256, 512, 4096, 1024, 10),
 ]
 
 SONICMOE_SHAPES = [
@@ -49,6 +56,10 @@ SONICMOE_SHAPES = [
     (4, 256, 7168, 2048, 8),
     (16, 256, 7168, 2048, 8),
     (64, 256, 7168, 2048, 8),
+    (1, 512, 4096, 1024, 10),
+    (4, 512, 4096, 1024, 10),
+    (16, 512, 4096, 1024, 10),
+    (64, 512, 4096, 1024, 10),
 ]
 
 # =====================================================================
@@ -282,41 +293,36 @@ class FusedMoEFp8BlockwiseHPCBenchmark(Benchmark):
             config, self.block_shape, flag_gems.device,
             sort_topk_ids=True,
         )
-        from flag_gems.ops.per_token_group_quant_fp8 import per_token_group_quant_fp8
-        hidden_states, a1_scale = per_token_group_quant_fp8(
-            hidden_states,
-            group_size=self.block_shape[1],
-            dtype=torch.float8_e4m3fn,
-            column_major_scales=True,
-            scale_ue8m0=False,
-        )
-        hidden_states = hidden_states.contiguous()
-        a1_scale = a1_scale.contiguous()
-
-        yield hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts
+        yield hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts
 
 @pytest.mark.fused_moe
 @pytest.mark.skipif(not HAS_HPC, reason="hpc-ops not installed")
 def test_perf_fused_moe_fp8_blockwise_gems_vs_hpc():
     """Benchmark FlagGems vs hpc-ops fused_moe (fp8 w8a8 block-wise 128x128)."""
     def _hpc_fp8_blockwise_wrapper(
-        hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
     ):
+        from flag_gems.ops.per_token_group_quant_fp8 import per_token_group_quant_fp8
+        hidden_states_q, a1_scale = per_token_group_quant_fp8(
+            hidden_states,
+            group_size=DEFAULT_BLOCK_SHAPE[1],
+            dtype=torch.float8_e4m3fn,
+            column_major_scales=False,
+            scale_ue8m0=False,
+        )
         return hpc.fuse_moe_blockwise_fp8(
-            hidden_states, a1_scale, w1, w1_scale, w2, w2_scale, topk_ids, topk_weights, 0, num_experts,
+            hidden_states_q, a1_scale, w1, w1_scale, w2, w2_scale, topk_ids, topk_weights, 0, num_experts,
         )
     def _gems_fp8_blockwise_wrapper(
-        hidden_states, a1_scale, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, num_experts,
     ):
         return flag_gems.fused_experts_impl(
             hidden_states, w1, w2, topk_weights, topk_ids,
-            num_experts=num_experts,
+            global_num_experts=num_experts,
             use_fp8_w8a8=True,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             block_shape=DEFAULT_BLOCK_SHAPE,
-            a1_scale=a1_scale,
-            out_dtype=torch.bfloat16, # must be bf16
         )
     bench = FusedMoEFp8BlockwiseHPCBenchmark(
         op_name="fused_moe_fp8_blockwise_gems_vs_hpc",
