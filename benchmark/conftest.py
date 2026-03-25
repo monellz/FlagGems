@@ -151,15 +151,6 @@ def pytest_addoption(parser):
         help="Benchmark info recorded in log files or not",
     )
 
-    parser.addoption(
-        "--use_cudagraph",
-        action="store_true",
-        default=False,
-        required=False,
-        help="use cuda graph to benchmark if possisble",
-    )
-
-
 def pytest_configure(config):
     global Config  # noqa: F824
     mode_value = config.getoption(
